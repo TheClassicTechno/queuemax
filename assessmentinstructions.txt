@@ -1,0 +1,21 @@
+Queuemaxxing 💪
+Write a HTTP application that is a frankenstein queue. It should be able to support basic functionality like:
+FIFO or LIFO
+Priority
+Delay
+
+Such that at the end, we can have a delay, priority LIFO queue, or a priority FIFO.
+
+Once this queue is built, provide a simple application that can use and interact with the queue that you have just implemented.
+Requirements
+Data must be persisted, durable and protected from application restarts
+Storage cannot be delegated to a separate queue or database
+Queue must support concurrency
+Additional questions
+How do you handle replay messages?
+How would you refactor your queue into a Pub/Sub?
+If you had more time, what other features would you add?
+Why would users choose your queue over incumbents like Amazon SQS, RabbitMQ or Apache Pulsar?
+Submissions
+Email a link to your GitHub repo to robin@artie.com
+
