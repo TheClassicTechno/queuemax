@@ -2,7 +2,9 @@ package queue
 
 import (
 	"container/heap"
+	"fmt"
 	"sync"
+	"time"
 )
 
 // Ordering defines how a queue's Ready messages are ordered.
@@ -109,4 +111,54 @@ func (q *Queue) DelayedLen() int {
 	defer q.mu.Unlock()
 	q.promoteEligibleLocked()
 	return q.delayed.Len()
+}
+
+// EnqueueDurable allocates a stable ID and monotonic sequence for a new
+// message and invokes appendFn — wired by the Manager to a WAL
+// append+fsync — before placing the message into Ready or Delayed. The
+// per-queue lock is held across appendFn deliberately: it serializes
+// sequence allocation with the durable write it describes, and it keeps a
+// concurrent Dequeue from ever observing a message whose WAL record isn't
+// synced yet (crash-safety invariant #1). A failed appendFn leaves the
+// sequence counter advanced (an accepted, harmless gap) but the message is
+// never placed into memory.
+func (q *Queue) EnqueueDurable(payload []byte, priority int, delay time.Duration, appendFn func(Message) error) (Message, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := q.clock.Now()
+	seq := q.nextSeq
+	q.nextSeq++
+
+	msg := Message{
+		ID:          fmt.Sprintf("%s-%d", q.config.Name, seq),
+		Payload:     payload,
+		Priority:    priority,
+		Sequence:    seq,
+		EnqueuedAt:  now,
+		AvailableAt: now.Add(delay),
+	}
+
+	if err := appendFn(msg); err != nil {
+		return Message{}, err
+	}
+
+	if msg.AvailableAt.After(now) {
+		heap.Push(&q.delayed, msg)
+	} else {
+		heap.Push(&q.ready, msg)
+	}
+	return msg, nil
+}
+
+// restoreSequenceState raises nextSeq to at least next, per
+// DESIGN_DECISIONS.md #5 ("recovered as max(seen)+1 during WAL replay").
+// Called once by the Manager after replaying all ENQUEUE records for this
+// queue.
+func (q *Queue) restoreSequenceState(next uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if next > q.nextSeq {
+		q.nextSeq = next
+	}
 }

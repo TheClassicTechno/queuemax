@@ -71,3 +71,8 @@ Frozen before implementation begins (Phase 1). These are the only behaviors call
 **Behavior:** Format `messageID:deliveryAttemptSeq`, where `deliveryAttemptSeq` is an in-memory counter incremented on every (re)delivery. ACK is honored only if the presented attempt-seq matches the message's current attempt-seq, checked under the same per-queue lock as lease-expiry evaluation — expiry is lazy/logical, evaluated only under that lock, never an eager out-of-band mutation racing ACK. A late-but-still-current ACK wins over expiry as long as no newer `receive()` has already superseded it.
 **Rationale:** Resolves the ACK-vs-lease-expiry race identified in the Phase 0 review; directly satisfies the invariant that a stale receipt handle cannot ACK a newer delivery.
 **Tradeoff:** Requires the expiry check and ACK check to be genuinely serialized through one lock — must be covered by a dedicated concurrent test in a later phase.
+
+## 15. Duplicate queue creation
+**Behavior:** `CreateQueue` for a name that already exists returns an error (`ErrQueueExists`); it is not an idempotent no-op, and does not check whether the requested config matches the existing one.
+**Rationale:** Flagged as ambiguous in the Phase 0 review and left open. Resolved here in favor of the safer default — silently accepting a call that might carry a *different* config than the one already durable would let a caller believe it changed a queue's semantics when it did not.
+**Tradeoff:** A caller that intends "create if missing" must first check `GET /queues` or tolerate the error; slightly less convenient than idempotent creation.
