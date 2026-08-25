@@ -14,6 +14,18 @@ const (
 	OpAck
 )
 
+// valid reports whether op is a recognized OpType. Replay rejects any
+// other value as corruption rather than passing it through — see
+// CRASH_AUDIT.md and STEP_BY_STEP_PROMPTS.md Phase 12.
+func (op OpType) valid() bool {
+	switch op {
+	case OpCreateQueue, OpEnqueue, OpAck:
+		return true
+	default:
+		return false
+	}
+}
+
 // Record is one logical WAL entry as returned by Replay.
 type Record struct {
 	Op      OpType

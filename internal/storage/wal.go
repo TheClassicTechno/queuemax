@@ -107,6 +107,15 @@ func (w *WAL) Replay(fn func(Record) error) (int, error) {
 			return count, fmt.Errorf("%w: unsupported version %d at record %d", ErrCorrupt, h.version, count)
 		}
 
+		if !h.op.valid() {
+			// A checksum-consistent record with an unrecognized op can't
+			// be explained by an ordinary crash (a crash truncates bytes;
+			// it doesn't produce internally-consistent records for op
+			// values nothing ever wrote) — so, unlike length/checksum
+			// errors below, this gets no tail-truncation leniency.
+			return count, fmt.Errorf("%w: unknown op %d at record %d", ErrCorrupt, h.op, count)
+		}
+
 		if h.length > MaxPayloadBytes {
 			more, err := w.hasMoreData()
 			if err != nil {

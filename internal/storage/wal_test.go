@@ -347,6 +347,114 @@ func TestReplayValidPrefixDamagedTailViaTruncate(t *testing.T) {
 	}
 }
 
+func TestReplayBadMagicRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	rec := encodeRecord(OpEnqueue, []byte("a"))
+	rec[0] = 'X' // corrupt the magic
+	writeRaw(t, path, rec)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	n, err := w.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Replay error = %v, want it to wrap ErrCorrupt", err)
+	}
+	if n != 0 {
+		t.Fatalf("n = %d, want 0", n)
+	}
+}
+
+func TestReplayUnsupportedVersionRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	rec := encodeRecord(OpEnqueue, []byte("a"))
+	rec[4] = currentVersion + 1 // bump the version byte only — checksum is over
+	// version+op+length+payload, so this also makes the checksum wrong,
+	// but the version check must fire before the checksum is even compared.
+	writeRaw(t, path, rec)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	n, err := w.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Replay error = %v, want it to wrap ErrCorrupt", err)
+	}
+	if n != 0 {
+		t.Fatalf("n = %d, want 0", n)
+	}
+}
+
+// TestReplayUnknownOpRejectedMidLog attacks Replay with a record that is
+// otherwise perfectly well-formed — correct magic, version, length, and a
+// checksum computed over its own (unrecognized) op byte — but whose op
+// value isn't any known OpType. Unlike a torn header/body/checksum, this
+// can't be explained by an ordinary crash (a crash truncates bytes; it
+// doesn't produce internally-consistent records for op values nothing
+// ever wrote), so it must be rejected outright, even mid-log, not given
+// the tail-truncation leniency length/checksum errors get.
+func TestReplayUnknownOpRejectedMidLog(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	rec1 := encodeRecord(OpEnqueue, []byte("a"))
+	badRec := encodeRecord(OpType(99), []byte("b")) // checksum is internally consistent
+	rec3 := encodeRecord(OpEnqueue, []byte("c"))
+
+	raw := append(append(append([]byte{}, rec1...), badRec...), rec3...)
+	writeRaw(t, path, raw)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	n, err := w.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Replay error = %v, want it to wrap ErrCorrupt (unknown op must never be silently skipped)", err)
+	}
+	if n != 1 {
+		t.Fatalf("n = %d, want 1 (only the valid record before the unknown op)", n)
+	}
+}
+
+func TestReplayRandomBytesRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	// Deterministic "garbage" — not a WAL file at all.
+	garbage := make([]byte, 4096)
+	for i := range garbage {
+		garbage[i] = byte((i*2654435761 + 17) >> 3)
+	}
+	writeRaw(t, path, garbage)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	n, err := w.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Replay error = %v, want it to wrap ErrCorrupt", err)
+	}
+	if n != 0 {
+		t.Fatalf("n = %d, want 0", n)
+	}
+}
+
 func TestAppendRejectsOversizedPayload(t *testing.T) {
 	w, _ := openTestWAL(t)
 

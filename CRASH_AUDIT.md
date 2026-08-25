@@ -21,13 +21,23 @@ not an assumed one.
 
 ## Findings
 
-No bug was found: every crash point above is safe by the existing
-design, not by luck. The one gap in test coverage this audit closed is
-**double replay** — calling `Replay` a second time with no new writes in
-between, verifying it reproduces identical state rather than
-duplicating or dropping anything. See
-`TestDoubleRestartProducesStableState` in
-`internal/queue/crash_audit_test.go`.
+Every crash point above is safe by the existing design, not by luck.
+Two gaps in test coverage (Phase 11/12) turned up real work:
+
+- **Double replay** — calling `Replay` a second time with no new writes
+  in between must reproduce identical state, not duplicate or drop
+  anything. Was untested; see `TestDoubleRestartProducesStableState` in
+  `internal/queue/crash_audit_test.go`.
+- **Unknown op (Phase 12, a real bug, fixed)** — a record with correct
+  magic, version, length, and a checksum computed over its own
+  (unrecognized) op byte was silently dropped by `Replay` and by
+  `Manager`'s replay switch, instead of being rejected. This can't be
+  explained by an ordinary crash (a crash truncates bytes; it doesn't
+  produce internally-consistent records for op values nothing ever
+  wrote), so `Replay` now rejects any unrecognized op unconditionally —
+  no tail-truncation leniency, unlike length/checksum errors. See
+  `OpType.valid` in `internal/storage/record.go` and
+  `TestReplayUnknownOpRejectedMidLog` in `internal/storage/wal_test.go`.
 
 The one accepted, non-bug limitation this audit surfaces explicitly:
 ENQUEUE has no idempotency key, so a producer that times out waiting
