@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"sync"
 	"time"
 
@@ -309,4 +310,43 @@ func (m *Manager) Ack(queueName, receiptHandle string) error {
 		}
 		return m.wal.Append(storage.OpAck, enc)
 	})
+}
+
+// ListQueues returns the configuration of every registered queue, sorted
+// by name for deterministic output.
+func (m *Manager) ListQueues() []Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]Config, 0, len(m.queues))
+	for _, q := range m.queues {
+		out = append(out, q.Config())
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// QueueStats reports point-in-time message counts for one queue.
+type QueueStats struct {
+	Name     string `json:"name"`
+	Ready    int    `json:"ready"`
+	Delayed  int    `json:"delayed"`
+	InFlight int    `json:"in_flight"`
+}
+
+// Stats reports point-in-time Ready/Delayed/InFlight counts for the named
+// queue.
+func (m *Manager) Stats(queueName string) (QueueStats, error) {
+	m.mu.RLock()
+	q, ok := m.queues[queueName]
+	m.mu.RUnlock()
+	if !ok {
+		return QueueStats{}, ErrQueueNotFound
+	}
+	return QueueStats{
+		Name:     queueName,
+		Ready:    q.ReadyLen(),
+		Delayed:  q.DelayedLen(),
+		InFlight: q.InFlightLen(),
+	}, nil
 }

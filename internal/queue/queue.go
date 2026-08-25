@@ -146,6 +146,27 @@ func (q *Queue) DelayedLen() int {
 	return q.delayed.Len()
 }
 
+// InFlightLen reports how many messages are currently leased to a
+// consumer and not yet Acked or lazily requeued by lease expiry.
+func (q *Queue) InFlightLen() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := 0
+	for _, entry := range q.ledger {
+		if entry.leased {
+			n++
+		}
+	}
+	return n
+}
+
+// Config returns a copy of this queue's configuration.
+func (q *Queue) Config() Config {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.config
+}
+
 // EnqueueDurable allocates a stable ID and monotonic sequence for a new
 // message and invokes appendFn — wired by the Manager to a WAL
 // append+fsync — before placing the message into Ready or Delayed. The
