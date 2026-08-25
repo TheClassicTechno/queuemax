@@ -45,6 +45,28 @@ same WAL file mid-process (`WAL.Close` → `storage.Open` →
 `queue.NewManager`) rather than spawning a second OS process — it
 exercises the real replay path, just without a process boundary.
 
+### Demo output
+
+Actual output from a `make demo` run against this repo:
+
+```
+$ make demo
+go run ./cmd/demo
+FrankenQueue reviewer demo
+==========================
+[PASS] 1. create queue (fifo-demo)                   expected=201                  observed=201
+[PASS] 2. FIFO order (A,B,C)                         expected=fifo-demo-0,fifo-demo-1,fifo-demo-2 observed=fifo-demo-0,fifo-demo-1,fifo-demo-2
+[PASS] 3. LIFO order (C,B,A)                         expected=lifo-demo-2,lifo-demo-1,lifo-demo-0 observed=lifo-demo-2,lifo-demo-1,lifo-demo-0
+[PASS] 4. priority order (high,mid,low)              expected=priority-demo-1,priority-demo-2,priority-demo-0 observed=priority-demo-1,priority-demo-2,priority-demo-0
+[PASS] 5. delayed message (no early delivery, then ready) expected=empty,then delay-demo-0 observed=empty=true,then=delay-demo-0
+[PASS] 6. ACK                                        expected=200                  observed=200
+[PASS] 7. no ACK -> expiry -> redelivery (same ID, new handle) expected=same id, handle changes observed=id_match=true,handle_changed=true
+[PASS] 8. restart durability (message survives)      expected=restart-demo-0       observed=restart-demo-0
+[PASS] 9. stats reflects queue state                 expected=well-formed stats object observed=map[delayed:0 in_flight:0 name:fifo-demo ready:3]
+==========================
+All steps PASSED
+```
+
 ## Queue configuration
 
 ```json
