@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"sort"
 	"time"
 
 	"queuemax/internal/queue"
@@ -80,14 +79,14 @@ func (h *handler) createQueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toQueueResponse(cfg))
 }
 
-// listQueues handles GET /queues.
+// listQueues handles GET /queues. Manager.ListQueues already returns
+// queues sorted by name, so this only translates the type.
 func (h *handler) listQueues(w http.ResponseWriter, r *http.Request) {
 	cfgs := h.mgr.ListQueues()
 	out := make([]queueResponse, len(cfgs))
 	for i, cfg := range cfgs {
 		out[i] = toQueueResponse(cfg)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	writeJSON(w, http.StatusOK, out)
 }
 
