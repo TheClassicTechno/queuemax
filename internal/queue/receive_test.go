@@ -4,6 +4,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"queuemax/internal/storage"
 )
 
 func newVisibilityQueue(t *testing.T, timeoutMS int64, clock Clock) *Queue {
@@ -117,6 +119,47 @@ func TestLateAckBeforeRedeliveryWinsOverExpiry(t *testing.T) {
 	// It must not be redeliverable — the late Ack pulled it back out of Ready.
 	if _, ok := q.Receive(); ok {
 		t.Fatal("Receive after late Ack: expected nothing, message should be gone")
+	}
+}
+
+func TestRestartWhileInFlightMakesMessageEligibleAgain(t *testing.T) {
+	wal, path := openTestWAL(t)
+	clock := NewManualClock(time.Unix(1000, 0))
+	m := newTestManager(t, wal, clock)
+
+	if err := m.CreateQueue(Config{Name: "jobs", Ordering: OrderingFIFO, VisibilityTimeoutMS: 30000}); err != nil {
+		t.Fatalf("CreateQueue: %v", err)
+	}
+	if _, err := m.Enqueue("jobs", []byte("x"), 0, 0); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	d, ok, err := m.Receive("jobs")
+	if err != nil || !ok {
+		t.Fatalf("Receive: ok=%v err=%v", ok, err)
+	}
+	staleHandle := d.ReceiptHandle
+	wal.Close() // simulate a crash: consumer never Acked
+
+	wal2, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("reopen WAL: %v", err)
+	}
+	defer wal2.Close()
+	m2 := newTestManager(t, wal2, clock)
+
+	// Ephemeral lease state is gone; the message is Ready again.
+	d2, ok, err := m2.Receive("jobs")
+	if err != nil || !ok {
+		t.Fatalf("Receive after restart: ok=%v err=%v", ok, err)
+	}
+	if d2.Message.ID != d.Message.ID {
+		t.Fatalf("redelivered ID after restart = %q, want stable ID %q", d2.Message.ID, d.Message.ID)
+	}
+
+	// The pre-restart handle must be permanently invalid (DESIGN_DECISIONS.md #10).
+	if err := m2.Ack("jobs", staleHandle); err != ErrStaleReceiptHandle {
+		t.Fatalf("Ack with pre-restart handle: got %v, want ErrStaleReceiptHandle", err)
 	}
 }
 

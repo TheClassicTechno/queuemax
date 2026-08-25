@@ -252,6 +252,30 @@ func (q *Queue) Ack(receiptHandle string) error {
 	return nil
 }
 
+// AckDurable validates receiptHandle exactly like Ack, then invokes
+// appendFn — wired by the Manager to a WAL append+fsync of the ACK record
+// — before removing any in-memory trace of the message. Validation happens
+// before appendFn (a stale/wrong handle must never touch the WAL at all);
+// the in-memory removal happens only after appendFn succeeds, so a failed
+// or crashed append leaves the message exactly as it was — still in-flight
+// or sitting in Ready after a lazy expiry — and it will simply be
+// redelivered later. That is at-least-once working as intended, never a
+// silently-dropped ACK.
+func (q *Queue) AckDurable(receiptHandle string, appendFn func(messageID string) error) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	id, err := q.validateReceiptHandleLocked(receiptHandle)
+	if err != nil {
+		return err
+	}
+	if err := appendFn(id); err != nil {
+		return err
+	}
+	q.completeAckLocked(id)
+	return nil
+}
+
 // validateReceiptHandleLocked checks receiptHandle against this queue's
 // epoch and the message's current delivery attempt, per
 // DESIGN_DECISIONS.md #14. Must be called with q.mu held.

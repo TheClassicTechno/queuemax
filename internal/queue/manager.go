@@ -65,6 +65,12 @@ type enqueuePayload struct {
 	AvailableAt time.Time
 }
 
+// ackPayload is the WAL payload shape for OpAck.
+type ackPayload struct {
+	QueueName string
+	MessageID string
+}
+
 // enqueueQueueRef decodes only the QueueName field out of an OpEnqueue
 // record. json.Unmarshal skips decoding JSON fields with no matching
 // struct field, so this is used in NewManager's first replay pass to check
@@ -92,10 +98,15 @@ func NewManager(wal *storage.WAL, clock Clock) (*Manager, error) {
 		queues: make(map[string]*Queue),
 	}
 
-	// Pass 1: rebuild the queue registry. ENQUEUE records are only
-	// checked for a valid queue reference here (decoded via
-	// enqueueQueueRef, so the message payload itself is never allocated)
-	// — materialization happens in pass 2 below, one record at a time.
+	// Pass 1: rebuild the queue registry and the set of durably-ACKed
+	// message IDs. ENQUEUE records are only checked for a valid queue
+	// reference here (decoded via enqueueQueueRef, so the message payload
+	// itself is never allocated) — a WAL of any real size would otherwise
+	// force recovery to hold every enqueued message's full payload in
+	// memory at once just to find out most of them are unaffected by any
+	// ACK. Materialization happens in pass 2 below, one record at a time.
+	acked := make(map[string]map[string]bool) // queueName -> messageID -> true
+
 	_, err := wal.Replay(func(rec storage.Record) error {
 		switch rec.Op {
 		case storage.OpCreateQueue:
@@ -123,6 +134,19 @@ func NewManager(wal *storage.WAL, clock Clock) (*Manager, error) {
 				// than inventing a queue for it (invariant #8).
 				return fmt.Errorf("queue: ENQUEUE record for unknown queue %q", p.QueueName)
 			}
+
+		case storage.OpAck:
+			var p ackPayload
+			if err := json.Unmarshal(rec.Payload, &p); err != nil {
+				return fmt.Errorf("queue: decode ACK: %w", err)
+			}
+			if _, ok := m.queues[p.QueueName]; !ok {
+				return fmt.Errorf("queue: ACK record for unknown queue %q", p.QueueName)
+			}
+			if acked[p.QueueName] == nil {
+				acked[p.QueueName] = make(map[string]bool)
+			}
+			acked[p.QueueName][p.MessageID] = true
 		}
 		return nil
 	})
@@ -130,10 +154,10 @@ func NewManager(wal *storage.WAL, clock Clock) (*Manager, error) {
 		return nil, fmt.Errorf("queue: recover from WAL: %w", err)
 	}
 
-	// Pass 2: materialize every ENQUEUE straight into its queue's
-	// Ready/Delayed structure, one record at a time — nothing durable is
-	// ever buffered across records, only the small per-queue nextSeq
-	// counters below.
+	// Pass 2: materialize every non-ACKed ENQUEUE straight into its
+	// queue's Ready/Delayed structure, one record at a time — nothing
+	// durable is ever buffered across records, only the small per-queue
+	// nextSeq counters below.
 	nextSeq := make(map[string]uint64)
 
 	_, err = wal.Replay(func(rec storage.Record) error {
@@ -144,11 +168,14 @@ func NewManager(wal *storage.WAL, clock Clock) (*Manager, error) {
 		if err := json.Unmarshal(rec.Payload, &p); err != nil {
 			return fmt.Errorf("queue: decode ENQUEUE: %w", err)
 		}
-		// Sequence numbers are never reused (DESIGN_DECISIONS.md #5) —
-		// advance nextSeq regardless of whether this message gets
-		// materialized below.
+		// Sequence numbers are never reused, ACKed or not
+		// (DESIGN_DECISIONS.md #5) — advance nextSeq regardless of
+		// whether this message gets materialized below.
 		if p.Sequence+1 > nextSeq[p.QueueName] {
 			nextSeq[p.QueueName] = p.Sequence + 1
+		}
+		if acked[p.QueueName][p.ID] {
+			return nil // durably ACKed before the crash — stays gone
 		}
 		m.queues[p.QueueName].Enqueue(Message{
 			ID:          p.ID,
@@ -261,4 +288,25 @@ func (m *Manager) Receive(queueName string) (Delivery, bool, error) {
 
 	d, ok := q.Receive()
 	return d, ok, nil
+}
+
+// Ack durably completes a delivery on the named queue by receipt handle.
+// Success means the ACK record is appended and synced before the message
+// is removed from derived state (DESIGN_DECISIONS.md #7) — a successful
+// ACK remains consumed after restart.
+func (m *Manager) Ack(queueName, receiptHandle string) error {
+	m.mu.RLock()
+	q, ok := m.queues[queueName]
+	m.mu.RUnlock()
+	if !ok {
+		return ErrQueueNotFound
+	}
+
+	return q.AckDurable(receiptHandle, func(messageID string) error {
+		enc, err := json.Marshal(ackPayload{QueueName: queueName, MessageID: messageID})
+		if err != nil {
+			return fmt.Errorf("queue: encode ACK: %w", err)
+		}
+		return m.wal.Append(storage.OpAck, enc)
+	})
 }
