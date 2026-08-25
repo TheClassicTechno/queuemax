@@ -1,4 +1,4 @@
-# FrankenQueue
+# FrankenQueue by juli huang
 
 A durable, composable HTTP job queue in Go — FIFO/LIFO × priority ×
 delay, at-least-once delivery, and crash-safe restart, all built directly
