@@ -246,3 +246,19 @@ func (m *Manager) Enqueue(queueName string, payload []byte, priority int, delay 
 		return m.wal.Append(storage.OpEnqueue, enc)
 	})
 }
+
+// Receive leases the next eligible message from the named queue.
+// RECEIVE is never written to the WAL (DESIGN_DECISIONS.md #9) — this is
+// purely an in-memory lease. ok is false if the queue has nothing
+// currently deliverable.
+func (m *Manager) Receive(queueName string) (Delivery, bool, error) {
+	m.mu.RLock()
+	q, ok := m.queues[queueName]
+	m.mu.RUnlock()
+	if !ok {
+		return Delivery{}, false, ErrQueueNotFound
+	}
+
+	d, ok := q.Receive()
+	return d, ok, nil
+}

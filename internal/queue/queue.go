@@ -2,7 +2,11 @@ package queue
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
+	"math/rand/v2"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,8 +28,9 @@ type Config struct {
 }
 
 // Queue holds the in-memory derived state for one named queue: a Ready
-// heap ordered per its Config, and a Delayed heap holding messages not yet
-// eligible.
+// heap ordered per its Config, a Delayed heap holding messages not yet
+// eligible, and a ledger of ephemeral in-flight leases (DESIGN_DECISIONS.md
+// #9 — never persisted).
 type Queue struct {
 	mu      sync.Mutex
 	config  Config
@@ -33,7 +38,33 @@ type Queue struct {
 	ready   readyHeap
 	delayed delayedHeap
 	nextSeq uint64
+	ledger  map[string]*ledgerEntry
+	// epoch is a random value generated fresh on every construction
+	// (i.e. every process start — a Queue is never reused across a
+	// restart). It's folded into every receipt handle this Queue mints
+	// so a handle from before a restart can never collide with one
+	// minted after, even though the ephemeral, unpersisted attemptSeq
+	// counter restarts from zero both times (DESIGN_DECISIONS.md #9/#10).
+	epoch uint64
 }
+
+// ledgerEntry tracks the current delivery attempt for one message ID.
+// Entries are created on first delivery and deleted only on a successful
+// Ack; they are never persisted, so a restart wipes them, which is exactly
+// what makes every pre-restart receipt handle reject itself for free
+// (DESIGN_DECISIONS.md #10).
+type ledgerEntry struct {
+	msg        Message
+	attemptSeq uint64
+	leased     bool
+	leaseUntil time.Time
+}
+
+// ErrStaleReceiptHandle is returned by Ack for a handle that does not match
+// a message's current delivery attempt — either it was never delivered,
+// was already Acked, or has been superseded by a newer delivery
+// (DESIGN_DECISIONS.md #14).
+var ErrStaleReceiptHandle = errors.New("queue: stale or invalid receipt handle")
 
 // NewQueue constructs a Queue for the given configuration. A nil clock
 // defaults to the real wall clock.
@@ -44,6 +75,8 @@ func NewQueue(config Config, clock Clock) *Queue {
 	q := &Queue{
 		config: config,
 		clock:  clock,
+		ledger: make(map[string]*ledgerEntry),
+		epoch:  rand.Uint64(),
 	}
 	q.ready.index = make(map[string]int)
 	q.ready.less = lessFuncFor(config)
@@ -149,6 +182,135 @@ func (q *Queue) EnqueueDurable(payload []byte, priority int, delay time.Duration
 		heap.Push(&q.ready, msg)
 	}
 	return msg, nil
+}
+
+// Receive leases the next eligible message to a consumer. It first
+// lazily requeues any lease that has expired since the last call — no
+// background timer ever mutates queue state out of band
+// (DESIGN_DECISIONS.md #14) — then pops the next message per the queue's
+// ordering and hands out a receipt handle unique to this delivery attempt.
+// ok is false if nothing is currently deliverable.
+func (q *Queue) Receive() (Delivery, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := q.clock.Now()
+	q.promoteEligibleLocked()
+	q.requeueExpiredLocked(now)
+
+	if q.ready.Len() == 0 {
+		return Delivery{}, false
+	}
+
+	msg := heap.Pop(&q.ready).(Message)
+
+	entry, ok := q.ledger[msg.ID]
+	if !ok {
+		entry = &ledgerEntry{msg: msg}
+		q.ledger[msg.ID] = entry
+	}
+	entry.attemptSeq++
+	entry.leased = true
+	entry.leaseUntil = now.Add(time.Duration(q.config.VisibilityTimeoutMS) * time.Millisecond)
+
+	return Delivery{
+		Message:       msg,
+		ReceiptHandle: receiptHandle(msg.ID, q.epoch, entry.attemptSeq),
+		LeaseUntil:    entry.leaseUntil,
+	}, true
+}
+
+// requeueExpiredLocked pushes every leased message whose lease has expired
+// back into Ready by its original Sequence, without touching attemptSeq —
+// bumping only happens at actual redelivery, so a late-but-still-current
+// Ack still wins over a bare expiry (DESIGN_DECISIONS.md #14).
+func (q *Queue) requeueExpiredLocked(now time.Time) {
+	for _, entry := range q.ledger {
+		if entry.leased && !entry.leaseUntil.After(now) {
+			entry.leased = false
+			heap.Push(&q.ready, entry.msg)
+		}
+	}
+}
+
+// Ack completes the delivery identified by receiptHandle. A handle is
+// honored only if it names the message's current delivery attempt; this
+// covers both an ordinary stale/duplicate Ack and a redelivered message's
+// old handle. A late Ack that still matches the current attempt succeeds
+// even if its lease already expired — if the message was lazily requeued
+// into Ready but nothing has redelivered it yet, it is pulled back out
+// here (DESIGN_DECISIONS.md #14).
+func (q *Queue) Ack(receiptHandle string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	id, err := q.validateReceiptHandleLocked(receiptHandle)
+	if err != nil {
+		return err
+	}
+	q.completeAckLocked(id)
+	return nil
+}
+
+// validateReceiptHandleLocked checks receiptHandle against this queue's
+// epoch and the message's current delivery attempt, per
+// DESIGN_DECISIONS.md #14. Must be called with q.mu held.
+func (q *Queue) validateReceiptHandleLocked(receiptHandle string) (id string, err error) {
+	id, epoch, seq, ok := parseReceiptHandle(receiptHandle)
+	if !ok || epoch != q.epoch {
+		return "", ErrStaleReceiptHandle
+	}
+	entry, ok := q.ledger[id]
+	if !ok || seq != entry.attemptSeq {
+		return "", ErrStaleReceiptHandle
+	}
+	return id, nil
+}
+
+// completeAckLocked removes all in-memory trace of message id: if its
+// lease had already lazily expired back into Ready (the late-Ack-wins
+// case, DESIGN_DECISIONS.md #14), it's pulled back out from there too.
+// Must be called with q.mu held.
+func (q *Queue) completeAckLocked(id string) {
+	if entry := q.ledger[id]; entry != nil && !entry.leased {
+		q.removeReadyByIDLocked(id)
+	}
+	delete(q.ledger, id)
+}
+
+// removeReadyByIDLocked removes the message with the given ID from the
+// Ready heap, if present, in O(log n): an O(1) index lookup followed by
+// heap.Remove's O(log n) reshuffle. Reached only on the rare late-Ack-
+// after-expiry path, never on the hot Receive/Ack path.
+func (q *Queue) removeReadyByIDLocked(id string) {
+	if idx, ok := q.ready.index[id]; ok {
+		heap.Remove(&q.ready, idx)
+	}
+}
+
+func receiptHandle(id string, epoch, attemptSeq uint64) string {
+	return id + ":" + strconv.FormatUint(epoch, 16) + ":" + strconv.FormatUint(attemptSeq, 10)
+}
+
+// parseReceiptHandle splits a handle into id:epoch:attemptSeq. A queue
+// name's charset (DESIGN_DECISIONS.md #13) excludes ':', and the message
+// ID is "<queueName>-<sequence>", so id itself is always colon-free —
+// splitting on ':' unambiguously yields exactly 3 parts for a well-formed
+// handle.
+func parseReceiptHandle(h string) (id string, epoch, seq uint64, ok bool) {
+	parts := strings.Split(h, ":")
+	if len(parts) != 3 {
+		return "", 0, 0, false
+	}
+	epoch, err := strconv.ParseUint(parts[1], 16, 64)
+	if err != nil {
+		return "", 0, 0, false
+	}
+	seq, err = strconv.ParseUint(parts[2], 10, 64)
+	if err != nil {
+		return "", 0, 0, false
+	}
+	return parts[0], epoch, seq, true
 }
 
 // restoreSequenceState raises nextSeq to at least next, per
