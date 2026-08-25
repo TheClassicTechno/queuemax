@@ -109,7 +109,7 @@ func TestDelayedHighPriorityDoesNotBlockImmediateLowPriority(t *testing.T) {
 	clock := NewManualClock(t0)
 	q := NewQueue(Config{Ordering: OrderingFIFO, PriorityEnabled: true}, clock)
 
-	q.Enqueue(Message{Sequence: 1, Priority: 1, AvailableAt: t0}) // immediate, low priority
+	q.Enqueue(Message{Sequence: 1, Priority: 1, AvailableAt: t0})                         // immediate, low priority
 	q.Enqueue(Message{Sequence: 2, Priority: 100, AvailableAt: t0.Add(10 * time.Second)}) // delayed, high priority
 
 	msg, ok := q.Dequeue()
